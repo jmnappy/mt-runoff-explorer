@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: mt-runoff-explorer
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn streamflow_dev:server --bind 0.0.0.0:$PORT --timeout 120 --workers 2
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.6
+      - key: RENDER
+        value: true
+    plan: free
