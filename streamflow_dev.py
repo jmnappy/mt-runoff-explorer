@@ -269,6 +269,36 @@ def compute_timing_metrics(df, focus_year):
     if cur.empty or hist.empty:
         return metrics
 
+    # --- Latest values ---
+    latest = cur.iloc[-1]
+    metrics["latest_q"] = float(latest["q"])
+    metrics["latest_date"] = latest["date"]
+
+    # --- 24hr change ---
+    if len(cur) >= 2:
+        prev_q = cur.iloc[-2]["q"]
+        dq_24h = float(latest["q"] - prev_q)
+        metrics["dq_24h"] = dq_24h
+        if prev_q > 0:
+            metrics["dq_24h_pct"] = float(dq_24h / prev_q * 100)
+
+    # --- 7-day max ---
+    last7 = cur.tail(7)
+    if not last7.empty:
+        max_row = last7.loc[last7["q"].idxmax()]
+        metrics["q_7d_max"] = float(max_row["q"])
+        metrics["q_7d_max_date"] = max_row["date"]
+
+    # --- Current air temp ---
+    if "air_temp_mean_f" in cur.columns:
+        at_vals = cur.dropna(subset=["air_temp_mean_f"])
+        if not at_vals.empty:
+            latest_at = at_vals.iloc[-1]
+            metrics["air_temp"] = float(latest_at["air_temp_mean_f"])
+            if "air_temp_max_f" in at_vals.columns:
+                metrics["air_temp_max"] = float(latest_at.get("air_temp_max_f", np.nan))
+                metrics["air_temp_min"] = float(latest_at.get("air_temp_min_f", np.nan))
+
     # --- Median peak DOY historically ---
     hist_peaks = hist.groupby("year").apply(
         lambda g: g.loc[g["q"].idxmax(), "doy"] if len(g) > 60 else np.nan
@@ -326,6 +356,11 @@ def compute_timing_metrics(df, focus_year):
         if len(hist_at_doy) > 10:
             pctile = (hist_at_doy < latest_q[0]).sum() / len(hist_at_doy) * 100
             metrics["current_pctile"] = float(pctile)
+
+    # --- Historical median Q at current DOY ---
+    hist_now = hist[(hist["doy"] >= latest_doy - 3) & (hist["doy"] <= latest_doy + 3)]["q"]
+    if len(hist_now) > 5:
+        metrics["hist_median_q"] = float(hist_now.median())
 
     return metrics
 
@@ -803,69 +838,219 @@ def build_summary(df, name, focus_year, metrics):
         return html.Div("No data loaded", style={"fontSize": "13px", "padding": "10px",
                                                    "color": TEXT_DIM, "textAlign": "center"})
 
-    def card(label, value, sub=None, color=TEXT_CLR):
+    KPI_BG = "#2a2f38"
+    KPI_BORDER = "#3a4050"
+
+    def kpi_card(children):
+        return html.Div(children, style={
+            "backgroundColor": KPI_BG, "borderRadius": "6px",
+            "border": f"1px solid {KPI_BORDER}", "padding": "8px 10px",
+            "flex": "1", "minWidth": "115px",
+        })
+
+    def pctile_bar(pct):
+        """Mini horizontal percentile bar."""
+        if pct is None:
+            return None
+        # Color based on percentile
+        if pct < 10:
+            clr = "#ef4444"
+        elif pct < 25:
+            clr = "#f97316"
+        elif pct < 75:
+            clr = "#22d3ee"
+        elif pct < 90:
+            clr = "#3b82f6"
+        else:
+            clr = "#8b5cf6"
         return html.Div([
-            html.Div(label, style={"fontSize": "10px", "color": TEXT_DIM,
-                                    "textTransform": "uppercase", "letterSpacing": "0.5px"}),
-            html.Div(value, style={"fontSize": "17px", "fontWeight": "700",
-                                    "color": color, "lineHeight": "1.3"}),
-            html.Div(sub, style={"fontSize": "10px", "color": TEXT_DIM}) if sub else None,
-        ], style={"textAlign": "center", "flex": "1", "minWidth": "80px", "padding": "4px 2px"})
+            html.Div(style={
+                "width": f"{min(pct, 100):.0f}%", "height": "4px",
+                "backgroundColor": clr, "borderRadius": "2px",
+                "transition": "width 0.5s ease",
+            }),
+        ], style={
+            "width": "100%", "height": "4px", "backgroundColor": "#1e2228",
+            "borderRadius": "2px", "marginTop": "5px",
+        })
 
-    items = []
+    cards = []
 
-    # Current flow + percentile
-    cur = df[df["year"] == focus_year].sort_values("doy")
-    if not cur.empty:
-        lq = cur.iloc[-1]["q"]
-        ld = cur.iloc[-1]["date"]
-        pct = metrics.get("current_pctile")
-        pct_str = f"  ({pct:.0f}th %ile)" if pct is not None else ""
-        items.append(card("Current Q", f"{lq:,.0f} cfs",
-                          sub=f"{ld:%b %d}{pct_str}"))
+    # ── 1. CURRENT FLOW ──
+    lq = metrics.get("latest_q")
+    pct = metrics.get("current_pctile")
+    med_q = metrics.get("hist_median_q")
+    if lq is not None:
+        pct_color = "#ef4444" if pct and pct < 10 else "#f97316" if pct and pct < 25 else \
+                    "#22d3ee" if pct and pct < 75 else "#3b82f6" if pct and pct < 90 else \
+                    "#8b5cf6" if pct else "#22d3ee"
+        sub_parts = []
+        if pct is not None:
+            sub_parts.append(f"{pct:.0f}th percentile")
+        if med_q is not None:
+            sub_parts.append(f"Median: {med_q:,.0f}")
+        cards.append(kpi_card([
+            html.Div("Current flow", style={"fontSize": "10px", "color": TEXT_DIM,
+                                              "textTransform": "uppercase", "letterSpacing": "0.5px"}),
+            html.Div([
+                html.Span(f"{lq:,.0f}", style={"fontSize": "22px", "fontWeight": "700",
+                                                  "color": pct_color}),
+                html.Span(" cfs", style={"fontSize": "11px", "color": TEXT_DIM, "marginLeft": "3px"}),
+            ]),
+            html.Div(f"As of {metrics['latest_date']:%b %d}",
+                      style={"fontSize": "9px", "color": TEXT_DIM, "marginTop": "2px"}),
+            pctile_bar(pct),
+        ]))
 
-    # Trajectory
+    # ── 2. 24HR CHANGE ──
+    dq_24h = metrics.get("dq_24h")
+    dq_pct = metrics.get("dq_24h_pct")
+    if dq_24h is not None:
+        if dq_24h > 1:
+            arrow = "↑"
+            chg_color = "#22d3ee"
+            label = "increase"
+        elif dq_24h < -1:
+            arrow = "↓"
+            chg_color = "#f87171"
+            label = "decrease"
+        else:
+            arrow = "→"
+            chg_color = "#fbbf24"
+            label = "no change"
+        cards.append(kpi_card([
+            html.Div("24hr change", style={"fontSize": "10px", "color": TEXT_DIM,
+                                             "textTransform": "uppercase", "letterSpacing": "0.5px"}),
+            html.Div([
+                html.Span(f"{arrow}", style={"fontSize": "16px", "marginRight": "3px"}),
+                html.Span(f"{abs(dq_pct):.1f}" if dq_pct else "0",
+                           style={"fontSize": "22px", "fontWeight": "700", "color": chg_color}),
+                html.Span("%", style={"fontSize": "13px", "color": chg_color}),
+            ]),
+            html.Div(f"{abs(dq_24h):,.0f} cfs {label}",
+                      style={"fontSize": "9px", "color": TEXT_DIM, "marginTop": "2px"}),
+        ]))
+
+    # ── 3. 14-DAY TREND ──
     rdq = metrics.get("recent_dq")
     if rdq is not None:
         if rdq > 5:
-            traj = "↑ Rising"
+            traj = "Rising"
+            arrow = "▲"
             tc = "#22d3ee"
         elif rdq < -5:
-            traj = "↓ Falling"
+            traj = "Falling"
+            arrow = "▼"
             tc = "#f87171"
         else:
-            traj = "→ Stable"
+            traj = "Stable"
+            arrow = "●"
             tc = "#fbbf24"
-        items.append(card("14-Day Trend", traj,
-                          sub=f"{rdq:+,.0f} cfs/day", color=tc))
+        # Mini trend indicator dots
+        trend_dots = html.Div([
+            html.Div(style={
+                "width": "6px", "height": "6px", "borderRadius": "50%",
+                "backgroundColor": tc, "opacity": "1.0" if i == 2 else "0.3",
+                "display": "inline-block", "margin": "0 1px",
+            }) for i in range(3)
+        ], style={"marginTop": "4px"})
+        cards.append(kpi_card([
+            html.Div("14-day trend", style={"fontSize": "10px", "color": TEXT_DIM,
+                                              "textTransform": "uppercase", "letterSpacing": "0.5px"}),
+            html.Div([
+                html.Span(arrow, style={"fontSize": "14px", "marginRight": "4px", "color": tc}),
+                html.Span(traj, style={"fontSize": "20px", "fontWeight": "700", "color": tc}),
+            ]),
+            html.Div(f"{rdq:+,.0f} cfs/day avg",
+                      style={"fontSize": "9px", "color": TEXT_DIM, "marginTop": "2px"}),
+            trend_dots,
+        ]))
 
-    # Runoff onset
+    # ── 4. 7-DAY MAX ──
+    q7max = metrics.get("q_7d_max")
+    q7date = metrics.get("q_7d_max_date")
+    if q7max is not None:
+        cards.append(kpi_card([
+            html.Div("7-day max", style={"fontSize": "10px", "color": TEXT_DIM,
+                                           "textTransform": "uppercase", "letterSpacing": "0.5px"}),
+            html.Div([
+                html.Span(f"{q7max:,.0f}", style={"fontSize": "22px", "fontWeight": "700",
+                                                     "color": "#60a5fa"}),
+                html.Span(" cfs", style={"fontSize": "11px", "color": TEXT_DIM, "marginLeft": "3px"}),
+            ]),
+            html.Div(f"Reached {q7date:%b %d}" if hasattr(q7date, 'strftime') else "",
+                      style={"fontSize": "9px", "color": TEXT_DIM, "marginTop": "2px"}),
+        ]))
+
+    # ── 5. RUNOFF ONSET ──
     fo = metrics.get("focus_onset_doy")
     ho = metrics.get("hist_onset_doy")
-    if fo is not None:
-        diff = ""
-        dc = TEXT_CLR
-        if ho is not None:
-            d = fo - ho
-            diff = f" ({'+' if d > 0 else ''}{d}d vs med)"
-            dc = "#f87171" if d > 5 else "#22d3ee" if d < -5 else TEXT_CLR
-        items.append(card("Runoff Onset", doy_to_label(fo),
-                          sub=f"Median: {doy_to_label(ho)}{diff}" if ho else None, color=dc))
-    elif ho is not None:
-        items.append(card("Runoff Onset", "Not yet",
-                          sub=f"Median: {doy_to_label(ho)}"))
+    if fo is not None or ho is not None:
+        if fo is not None:
+            onset_val = doy_to_label(fo)
+            onset_color = TEXT_CLR
+            sub = ""
+            if ho is not None:
+                d = fo - ho
+                if d > 5:
+                    onset_color = "#f87171"
+                    sub = f"{d}d late vs median ({doy_to_label(ho)})"
+                elif d < -5:
+                    onset_color = "#22d3ee"
+                    sub = f"{abs(d)}d early vs median ({doy_to_label(ho)})"
+                else:
+                    sub = f"Near median ({doy_to_label(ho)})"
+        else:
+            onset_val = "Not yet"
+            onset_color = TEXT_DIM
+            sub = f"Median: {doy_to_label(ho)}" if ho else ""
+        cards.append(kpi_card([
+            html.Div("Runoff onset", style={"fontSize": "10px", "color": TEXT_DIM,
+                                              "textTransform": "uppercase", "letterSpacing": "0.5px"}),
+            html.Div(onset_val, style={"fontSize": "20px", "fontWeight": "700",
+                                        "color": onset_color}),
+            html.Div(sub, style={"fontSize": "9px", "color": TEXT_DIM, "marginTop": "2px"}) if sub else None,
+        ]))
 
-    # Peak
-    fp_doy = metrics.get("focus_peak_doy")
-    fp_q = metrics.get("focus_peak_q")
-    hp_doy = metrics.get("hist_peak_doy")
-    if fp_q is not None:
-        items.append(card("Peak So Far", f"{fp_q:,.0f} cfs",
-                          sub=f"{doy_to_label(fp_doy)} · Med peak: {doy_to_label(hp_doy)}" if hp_doy else doy_to_label(fp_doy)))
+    # ── 6. AIR TEMP ──
+    at = metrics.get("air_temp")
+    if at is not None and not np.isnan(at):
+        at_max = metrics.get("air_temp_max")
+        at_min = metrics.get("air_temp_min")
+        if at > 50:
+            at_color = "#f97316"
+        elif at > 32:
+            at_color = "#fbbf24"
+        else:
+            at_color = "#38bdf8"
+        # Freezing indicator
+        above_freezing = at > 32
+        freeze_dot = html.Div(style={
+            "width": "8px", "height": "8px", "borderRadius": "50%",
+            "backgroundColor": "#22c55e" if above_freezing else "#38bdf8",
+            "display": "inline-block", "marginRight": "5px", "verticalAlign": "middle",
+        })
+        sub_t = ""
+        if at_max is not None and at_min is not None and not np.isnan(at_max):
+            sub_t = f"High {at_max:.0f}° / Low {at_min:.0f}°"
+        cards.append(kpi_card([
+            html.Div("Air temp", style={"fontSize": "10px", "color": TEXT_DIM,
+                                          "textTransform": "uppercase", "letterSpacing": "0.5px"}),
+            html.Div([
+                freeze_dot,
+                html.Span(f"{at:.0f}", style={"fontSize": "22px", "fontWeight": "700",
+                                                "color": at_color}),
+                html.Span("°F", style={"fontSize": "13px", "color": at_color}),
+            ]),
+            html.Div(sub_t, style={"fontSize": "9px", "color": TEXT_DIM, "marginTop": "2px"}) if sub_t else None,
+            html.Div("Above freezing" if above_freezing else "Below freezing",
+                      style={"fontSize": "9px", "color": "#22c55e" if above_freezing else "#38bdf8",
+                             "marginTop": "2px"}),
+        ]))
 
-    return html.Div(items, style={
-        "display": "flex", "flexWrap": "wrap", "justifyContent": "space-around",
-        "padding": "8px 6px", "gap": "4px",
+    return html.Div(cards, style={
+        "display": "flex", "flexWrap": "wrap", "gap": "5px",
+        "padding": "6px", "overflowY": "auto", "maxHeight": "100%",
     })
 
 
@@ -958,6 +1143,7 @@ app.layout = html.Div(style={
             html.Div(id="summary-card", style={
                 "backgroundColor": CARD_BG, "borderRadius": "6px",
                 "border": f"1px solid {GRID_CLR}", "flexShrink": "0",
+                "maxHeight": "45%", "overflowY": "auto",
             }),
         ]),
 
