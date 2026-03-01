@@ -140,7 +140,40 @@ def fetch_usgs(site_no, start="1980-01-01", end=None):
     return out
 
 
+def fetch_usgs_iv(site_no, days=7):
+    """Fetch instantaneous (15-min) discharge and water temp for the last N days."""
+    try:
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        df, _ = nwis.get_iv(sites=site_no, parameterCd="00060,00010",
+                            start=start, end=end)
+    except Exception as e:
+        print(f"  NWIS IV error: {e}")
+        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.reset_index()
+    q_col = _find_param_col(df, "00060")
+    t_col = _find_param_col(df, "00010")
+    if q_col is None:
+        return pd.DataFrame()
+    out = pd.DataFrame()
+    out["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
+    out["q"] = pd.to_numeric(df[q_col], errors="coerce")
+    if t_col:
+        wt = pd.to_numeric(df[t_col], errors="coerce")
+        wt[(wt < -5) | (wt > 40)] = np.nan
+        out["water_temp_f"] = wt * 9.0 / 5.0 + 32.0
+    else:
+        out["water_temp_f"] = np.nan
+    out = out.dropna(subset=["q"])
+    out = out[out["q"] >= 0].copy().sort_values("datetime").reset_index(drop=True)
+    print(f"  USGS IV: {len(out):,} records ({days}d)")
+    return out
+
+
 def fetch_air_temp(lat, lon, start="1980-01-01", end=None):
+    """Fetch daily air temperature from Open-Meteo archive + forecast APIs."""
     if end is None:
         end = datetime.now().strftime("%Y-%m-%d")
     start_dt, end_dt = pd.to_datetime(start), pd.to_datetime(end)
@@ -202,7 +235,7 @@ def fetch_all(site_no, start="1980-01-01"):
     print(f"\n{'='*60}\nFetching {site_no}\n{'='*60}")
     usgs = fetch_usgs(site_no, start=start)
     if usgs.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
     info = STATIONS.get(site_no, {})
     lat, lon = info.get("lat"), info.get("lon")
     if lat and lon:
@@ -219,7 +252,9 @@ def fetch_all(site_no, start="1980-01-01"):
     usgs["month"] = usgs["date"].dt.month
     usgs["doy"] = usgs["date"].dt.dayofyear
     print(f"  FINAL: {len(usgs):,} rows | wt:{usgs['water_temp_f'].notna().sum():,} | at:{usgs['air_temp_mean_f'].notna().sum():,}")
-    return usgs
+    # Fetch instantaneous values for recent detail
+    iv = fetch_usgs_iv(site_no, days=30)
+    return usgs, iv
 
 
 def search_sites(query_text, state="MT"):
@@ -260,7 +295,7 @@ def compute_derived(df):
     return df
 
 
-def compute_timing_metrics(df, focus_year):
+def compute_timing_metrics(df, focus_year, iv=None):
     """Compute runoff timing metrics for the focus year vs historical."""
     metrics = {}
     cur = df[df["year"] == focus_year].sort_values("doy").copy()
@@ -269,13 +304,35 @@ def compute_timing_metrics(df, focus_year):
     if cur.empty or hist.empty:
         return metrics
 
-    # --- Latest values ---
+    # --- Latest values (from daily) ---
     latest = cur.iloc[-1]
     metrics["latest_q"] = float(latest["q"])
     metrics["latest_date"] = latest["date"]
 
-    # --- 24hr change ---
-    if len(cur) >= 2:
+    # --- Override with IV data if available (more current) ---
+    if iv is not None and not iv.empty and len(iv) > 10:
+        iv_s = iv.sort_values("datetime")
+        latest_iv = iv_s.iloc[-1]
+        metrics["latest_q"] = float(latest_iv["q"])
+        metrics["latest_date"] = latest_iv["datetime"]
+        metrics["is_realtime"] = True
+        # 24hr change from IV: compare now vs 24h ago
+        cutoff_24h = latest_iv["datetime"] - pd.Timedelta(hours=24)
+        iv_24h_ago = iv_s[iv_s["datetime"] <= cutoff_24h]
+        if not iv_24h_ago.empty:
+            prev_q = float(iv_24h_ago.iloc[-1]["q"])
+            dq = float(latest_iv["q"]) - prev_q
+            metrics["dq_24h"] = dq
+            if prev_q > 0:
+                metrics["dq_24h_pct"] = float(dq / prev_q * 100)
+        # IV water temp
+        if "water_temp_f" in iv_s.columns:
+            wt_vals = iv_s.dropna(subset=["water_temp_f"])
+            if not wt_vals.empty:
+                metrics["water_temp"] = float(wt_vals.iloc[-1]["water_temp_f"])
+
+    # --- 24hr change (from daily, only if IV didn't already provide) ---
+    if "dq_24h" not in metrics and len(cur) >= 2:
         prev_q = cur.iloc[-2]["q"]
         dq_24h = float(latest["q"] - prev_q)
         metrics["dq_24h"] = dq_24h
@@ -742,7 +799,11 @@ def plot_full_year(df, name, focus_year):
 # TAB 3: DAILY RECORD + TREND
 # ═════════════════════════════════════════════════════════════════════════════
 
-def plot_daily_trend(df, name):
+def plot_daily_trend(df, name, iv=None):
+    """Daily Record + Real-Time: IV overlaid on 3-year daily, shared x-axis."""
+    if iv is None:
+        iv = pd.DataFrame()
+    has_iv = not iv.empty and len(iv) > 10
     has_wt = df["water_temp_f"].notna().sum() > 100
     has_at = df["air_temp_mean_f"].notna().sum() > 100
     n = 1 + int(has_wt) + int(has_at)
@@ -757,7 +818,7 @@ def plot_daily_trend(df, name):
                         vertical_spacing=0.05, row_heights=heights)
     df_s = df.sort_values("date").copy()
 
-    # Compute trend from FULL dataset
+    # Long-term trend from FULL dataset
     annual = df.groupby("year")["q"].mean().reset_index()
     annual["mid"] = pd.to_datetime(annual["year"].astype(str) + "-07-01")
     trend_trace = None
@@ -770,55 +831,80 @@ def plot_daily_trend(df, name):
             line=dict(color="#ef4444", width=2, dash="dash"),
             name=f"Trend ({sign}{slope:.1f} cfs/yr, p={p:.3f})")
 
-    # Filter to last 3 years for daily traces
+    # 3-year daily context
     max_year = df_s["year"].max()
     cutoff = pd.Timestamp(f"{max_year - 2}-01-01")
     df_3y = df_s[df_s["date"] >= cutoff].copy()
 
     row = 1
 
-    # Discharge — 3 years of daily
+    # ── Discharge panel ──
+    # Layer 1: 3-year daily (dim background)
     fig.add_trace(go.Scatter(
         x=df_3y["date"], y=df_3y["q"], mode="lines",
-        line=dict(color="#93c5fd", width=0.8), opacity=0.55,
-        name="Daily Q", hovertemplate="%{x|%b %d, %Y}: %{y:,.0f} cfs<extra></extra>"), row=row, col=1)
-    df_3y["q30"] = df_3y["q"].rolling(30, center=True, min_periods=7).mean()
+        line=dict(color="#64748b", width=0.6), opacity=0.35,
+        name="Daily Q (3yr)", legendgroup="daily",
+        hovertemplate="%{x|%b %d, %Y}: %{y:,.0f} cfs<extra>Daily</extra>"), row=row, col=1)
+    # 30-day rolling avg
+    df_3y_c = df_3y.copy()
+    df_3y_c["q30"] = df_3y_c["q"].rolling(30, center=True, min_periods=7).mean()
     fig.add_trace(go.Scatter(
-        x=df_3y["date"], y=df_3y["q30"], mode="lines",
-        line=dict(color="#3b82f6", width=2.5), name="30-Day Avg Q"), row=row, col=1)
-
-    # Trend line from full dataset (only show segment within 3-year window)
+        x=df_3y_c["date"], y=df_3y_c["q30"], mode="lines",
+        line=dict(color="#3b82f6", width=2), name="30-Day Avg Q"), row=row, col=1)
+    # Layer 2: IV 15-min (bright foreground, USGS-style)
+    if has_iv:
+        iv_s = iv.sort_values("datetime")
+        fig.add_trace(go.Scatter(
+            x=iv_s["datetime"], y=iv_s["q"], mode="lines",
+            line=dict(color="#22d3ee", width=1.2),
+            name="Real-Time (15-min)",
+            hovertemplate="%{x|%b %d %I:%M %p}: %{y:,.0f} cfs<extra>15-min</extra>"), row=row, col=1)
+    # Long-term trend
     if trend_trace is not None:
         fig.add_trace(trend_trace, row=row, col=1)
-
     fig.update_yaxes(title_text="Discharge (cfs)", rangemode="tozero",
                      gridcolor=GRID_CLR, row=row, col=1)
     row += 1
 
+    # ── Water temp panel ──
     if has_wt:
         s = df_3y.dropna(subset=["water_temp_f"]).copy()
         if not s.empty:
             fig.add_trace(go.Scatter(
                 x=s["date"], y=s["water_temp_f"], mode="lines",
-                line=dict(color="#fdba74", width=0.8), opacity=0.55, name="Daily Water Temp"), row=row, col=1)
+                line=dict(color="#94a3b8", width=0.6), opacity=0.35,
+                name="Daily Water Temp", legendgroup="wt_d",
+                hovertemplate="%{x|%b %d, %Y}: %{y:.1f}\u00b0F<extra>Daily</extra>"), row=row, col=1)
             s["avg30"] = s["water_temp_f"].rolling(30, center=True, min_periods=7).mean()
             fig.add_trace(go.Scatter(
                 x=s["date"], y=s["avg30"], mode="lines",
-                line=dict(color="#ea580c", width=2.5), name="30-Day Water Temp"), row=row, col=1)
-        fig.update_yaxes(title_text="Water Temp (°F)", gridcolor=GRID_CLR, row=row, col=1)
+                line=dict(color="#ea580c", width=2), name="30-Day Water Temp"), row=row, col=1)
+        if has_iv and "water_temp_f" in iv.columns:
+            iv_wt = iv.dropna(subset=["water_temp_f"]).sort_values("datetime")
+            if not iv_wt.empty:
+                fig.add_trace(go.Scatter(
+                    x=iv_wt["datetime"], y=iv_wt["water_temp_f"], mode="lines",
+                    line=dict(color="#fb923c", width=1.2),
+                    name="Real-Time Water Temp",
+                    hovertemplate="%{x|%b %d %I:%M %p}: %{y:.1f}\u00b0F<extra>15-min</extra>"), row=row, col=1)
+        # 32F freezing line
+        fig.add_hline(y=32, line_dash="dot", line_color="#64748b",
+                      line_width=1, row=row, col=1)
+        fig.update_yaxes(title_text="Water Temp (\u00b0F)", gridcolor=GRID_CLR, row=row, col=1)
         row += 1
 
+    # ── Air temp panel ──
     if has_at:
         s = df_3y.dropna(subset=["air_temp_mean_f"]).copy()
         if not s.empty:
             fig.add_trace(go.Scatter(
                 x=s["date"], y=s["air_temp_mean_f"], mode="lines",
-                line=dict(color="#86efac", width=0.8), opacity=0.55, name="Daily Air Temp"), row=row, col=1)
+                line=dict(color="#94a3b8", width=0.6), opacity=0.35,
+                name="Daily Air Temp", legendgroup="at_d"), row=row, col=1)
             s["avg30"] = s["air_temp_mean_f"].rolling(30, center=True, min_periods=7).mean()
             fig.add_trace(go.Scatter(
                 x=s["date"], y=s["avg30"], mode="lines",
-                line=dict(color="#16a34a", width=2.5), name="30-Day Air Temp"), row=row, col=1)
-            # Max/min band
+                line=dict(color="#16a34a", width=2), name="30-Day Air Temp"), row=row, col=1)
             at = df_3y.dropna(subset=["air_temp_max_f", "air_temp_min_f"]).sort_values("date")
             if not at.empty:
                 fig.add_trace(go.Scatter(
@@ -827,11 +913,16 @@ def plot_daily_trend(df, name):
                                  at["air_temp_min_f"].rolling(7, min_periods=1).mean().iloc[::-1]]),
                     fill="toself", fillcolor="rgba(22,163,74,0.06)",
                     line=dict(width=0), showlegend=False, hoverinfo="skip"), row=row, col=1)
-        fig.update_yaxes(title_text="Air Temp (°F)", gridcolor=GRID_CLR, row=row, col=1)
+        # 32F freezing line
+        fig.add_hline(y=32, line_dash="dot", line_color="#64748b",
+                      line_width=1, row=row, col=1)
+        fig.update_yaxes(title_text="Air Temp (\u00b0F)", gridcolor=GRID_CLR, row=row, col=1)
 
+    # Layout
     yr_min, yr_max = df["year"].min(), df["year"].max()
+    iv_label = " + Real-Time" if has_iv else ""
     fig.update_layout(
-        title=dict(text=f"<b>{name}</b> — Last 3 Years (Trend from {yr_min}–{yr_max})",
+        title=dict(text=f"<b>{name}</b> \u2014 Daily Record{iv_label} (Trend: {yr_min}\u2013{yr_max})",
                    font=dict(size=15, color=TEXT_CLR), y=0.98, yanchor="top"),
         template=PLTLY,
         legend=dict(orientation="h", y=1.0, yanchor="bottom",
@@ -843,16 +934,24 @@ def plot_daily_trend(df, name):
     fig.update_xaxes(
         gridcolor=GRID_CLR,
         rangeselector=dict(buttons=[
+            dict(count=7, label="7d", step="day", stepmode="backward"),
+            dict(count=1, label="30d", step="month", stepmode="backward"),
             dict(count=6, label="6m", step="month", stepmode="backward"),
             dict(count=1, label="1y", step="year", stepmode="backward"),
-            dict(count=2, label="2y", step="year", stepmode="backward"),
             dict(step="all", label="3y"),
         ], bgcolor="#454b56", activecolor="#3b82f6", font=dict(size=12, color=TEXT_CLR)),
         row=n, col=1,
     )
+    # Default to 30-day view when IV is available
+    if has_iv:
+        x_end = iv["datetime"].max()
+        x_start = x_end - pd.Timedelta(days=30)
+        fig.update_xaxes(range=[x_start, x_end], row=n, col=1)
+
     for r in range(1, n):
         fig.update_xaxes(showticklabels=False, gridcolor=GRID_CLR, row=r, col=1)
     return fig
+
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -906,18 +1005,29 @@ def build_summary(df, name, focus_year, metrics):
     # ── 1. CURRENT FLOW ──
     lq = metrics.get("latest_q")
     pct = metrics.get("current_pctile")
+    is_rt = metrics.get("is_realtime", False)
     if lq is not None:
         pct_color = "#ef4444" if pct and pct < 10 else "#f97316" if pct and pct < 25 else \
                     "#22d3ee" if pct and pct < 75 else "#3b82f6" if pct and pct < 90 else \
                     "#8b5cf6" if pct else "#22d3ee"
+        ld = metrics.get("latest_date")
+        if is_rt and hasattr(ld, 'strftime'):
+            ts = ld.strftime("%b %d %I:%M %p")
+        elif hasattr(ld, 'strftime'):
+            ts = ld.strftime("%b %d")
+        else:
+            ts = ""
+        kpi_label = "Current flow" if not is_rt else "Current flow 🔴"
         pct_sub = f"{pct:.0f}th %ile" if pct is not None else ""
         med_q = metrics.get("hist_median_q")
-        sub_text = pct_sub
+        sub_text = ts
+        if pct_sub:
+            sub_text += f" · {pct_sub}"
         if med_q is not None:
             sub_text += f" · Med: {med_q:,.0f}"
-        cards.append(kpi("Current flow",
+        cards.append(kpi(kpi_label,
             html.Div([val_span(f"{lq:,.0f}", pct_color), unit_span(" cfs")]),
-            sub=[sub_text, pctile_bar(pct)] if sub_text or pct else sub_text))
+            sub=[sub_text, pctile_bar(pct)] if pct else sub_text))
 
     # ── 2. 24HR CHANGE ──
     dq_24h = metrics.get("dq_24h")
@@ -957,7 +1067,21 @@ def build_summary(df, name, focus_year, metrics):
             html.Div([val_span(f"{q7max:,.0f}", "#60a5fa"), unit_span(" cfs")]),
             dt_str))
 
-    # ── 5. RUNOFF ONSET ──
+    # ── 5. PEAK SO FAR ──
+    fp_q = metrics.get("focus_peak_q")
+    fp_doy = metrics.get("focus_peak_doy")
+    hp_doy = metrics.get("hist_peak_doy")
+    if fp_q is not None:
+        sub_parts = []
+        if fp_doy:
+            sub_parts.append(doy_to_label(fp_doy))
+        if hp_doy:
+            sub_parts.append(f"Med peak: {doy_to_label(hp_doy)}")
+        cards.append(kpi("Peak so far",
+            html.Div([val_span(f"{fp_q:,.0f}", "#a78bfa"), unit_span(" cfs")]),
+            " · ".join(sub_parts) if sub_parts else None))
+
+    # ── 6. RUNOFF ONSET ──
     fo = metrics.get("focus_onset_doy")
     ho = metrics.get("hist_onset_doy")
     if fo is not None or ho is not None:
@@ -982,34 +1106,36 @@ def build_summary(df, name, focus_year, metrics):
         cards.append(kpi("Runoff onset",
             val_span(onset_val, onset_color, "16px"), sub))
 
-    # ── 6. TEMPERATURE ──
+    # ── 7. TEMPERATURE ──
     at = metrics.get("air_temp")
     wt = metrics.get("water_temp")
-    if at is not None and not np.isnan(at):
-        at_color = "#f97316" if at > 50 else "#fbbf24" if at > 32 else "#38bdf8"
-        parts = [html.Span("🌡 ", style={"fontSize": "12px"}),
-                 val_span(f"{at:.0f}°", at_color, "16px"),
-                 unit_span("air", at_color)]
+    has_any_temp = (at is not None and not np.isnan(at)) or (wt is not None and not np.isnan(wt))
+    if has_any_temp:
+        parts = []
+        sub_parts = []
+        if at is not None and not np.isnan(at):
+            at_color = "#f97316" if at > 50 else "#fbbf24" if at > 32 else "#38bdf8"
+            parts += [val_span(f"{at:.0f}°", at_color, "16px"), unit_span("air", at_color)]
+            freeze = "Above" if at > 32 else "Below"
+            freeze_clr = "#22c55e" if at > 32 else "#38bdf8"
+            sub_parts.append(html.Span(f"{freeze} freezing", style={"color": freeze_clr, "fontSize": "9px"}))
+            at_max = metrics.get("air_temp_max")
+            at_min = metrics.get("air_temp_min")
+            if at_max and at_min and not np.isnan(at_max):
+                sub_parts.append(f"Hi {at_max:.0f}° Lo {at_min:.0f}°")
         if wt is not None and not np.isnan(wt):
             wt_color = "#fb923c" if wt > 50 else "#fbbf24" if wt > 40 else "#38bdf8"
-            parts += [html.Span(" / ", style={"color": TEXT_DIM, "fontSize": "12px"}),
-                      val_span(f"{wt:.0f}°", wt_color, "16px"),
-                      unit_span("water", wt_color)]
-        freeze = "Above" if at > 32 else "Below"
-        freeze_clr = "#22c55e" if at > 32 else "#38bdf8"
+            if parts:
+                parts += [html.Span(" / ", style={"color": TEXT_DIM, "fontSize": "11px"})]
+            parts += [val_span(f"{wt:.0f}°", wt_color, "16px"), unit_span("water", wt_color)]
         cards.append(kpi("Temperature",
             html.Div(parts),
-            html.Span(f"{freeze} freezing", style={"color": freeze_clr, "fontSize": "9px"})))
-    elif wt is not None and not np.isnan(wt):
-        wt_color = "#fb923c" if wt > 50 else "#fbbf24" if wt > 40 else "#38bdf8"
-        cards.append(kpi("Water temp",
-            html.Div([val_span(f"{wt:.0f}°", wt_color), unit_span("F")]),
-            None))
+            html.Div(sub_parts) if sub_parts else None))
 
     # 2-column grid
     return html.Div(cards, style={
         "display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "4px",
-        "padding": "5px",
+        "padding": "5px", "overflowY": "auto",
     })
 
 
@@ -1124,7 +1250,7 @@ app.layout = html.Div(style={
                              style={"padding": "2px 6px", "flexShrink": "0"}, children=[
                         dbc.Tab(label="⏱ Runoff Timing",        tab_id="t1"),
                         dbc.Tab(label="📊 Full Year Comparison", tab_id="t2"),
-                        dbc.Tab(label="📈 Daily Record & Trend", tab_id="t3"),
+                        dbc.Tab(label="📈 Real-Time & Trend", tab_id="t3"),
                     ]),
                     html.Div(id="graph-wrap", style={
                         "flex": "1", "minHeight": "0", "position": "relative",
@@ -1141,6 +1267,7 @@ app.layout = html.Div(style={
 
     # Stores
     dcc.Store(id="data-store"),
+    dcc.Store(id="iv-store"),
     dcc.Store(id="fig-t1"),
     dcc.Store(id="fig-t2"),
     dcc.Store(id="fig-t3"),
@@ -1190,6 +1317,7 @@ def sync_map(site):
 
 @app.callback(
     Output("data-store", "data"),
+    Output("iv-store", "data"),
     Output("status-msg", "children"),
     Output("year-dd", "options"),
     Output("year-dd", "value"),
@@ -1200,9 +1328,9 @@ def sync_map(site):
     prevent_initial_call=True,
 )
 def load_data(n, site, start_yr, current_focus):
-    df = fetch_all(site, start=f"{start_yr}-01-01")
+    df, iv = fetch_all(site, start=f"{start_yr}-01-01")
     if df.empty:
-        return None, "⚠️ No data returned.", [], None
+        return None, None, "⚠️ No data returned.", [], None
     # Compute derived columns
     df = compute_derived(df)
     years = sorted(df["year"].unique())
@@ -1216,9 +1344,12 @@ def load_data(n, site, start_yr, current_focus):
         flags.append("water temp ✓")
     if has_at:
         flags.append("air temp ✓")
+    if not iv.empty:
+        flags.append(f"IV: {len(iv):,} pts")
     extra = " · ".join(flags)
     msg = f"✓  {name}  ·  {len(df):,} records  ·  {years[0]}–{years[-1]} ({len(years)} yrs)  ·  {extra}"
-    return df.to_json(date_format="iso"), msg, yr_opts, focus
+    iv_json = iv.to_json(date_format="iso") if not iv.empty else None
+    return df.to_json(date_format="iso"), iv_json, msg, yr_opts, focus
 
 
 @app.callback(
@@ -1229,8 +1360,9 @@ def load_data(n, site, start_yr, current_focus):
     Input("data-store", "data"),
     Input("year-dd", "value"),
     State("station-dd", "value"),
+    State("iv-store", "data"),
 )
-def compute_figs(json_data, focus_year, site):
+def compute_figs(json_data, focus_year, site, iv_json):
     ef = empty_fig()
     if json_data is None:
         return ef.to_json(), ef.to_json(), ef.to_json(), build_summary(pd.DataFrame(), "", None, {})
@@ -1242,11 +1374,16 @@ def compute_figs(json_data, focus_year, site):
     df = df[df["q"] >= 0].copy()
     # Recompute derived (lost in JSON round-trip)
     df = compute_derived(df)
+    # Parse IV data
+    iv = pd.DataFrame()
+    if iv_json:
+        iv = pd.read_json(iv_json)
+        iv["datetime"] = pd.to_datetime(iv["datetime"])
     name = sname(site)
-    metrics = compute_timing_metrics(df, focus_year)
+    metrics = compute_timing_metrics(df, focus_year, iv)
     f1 = plot_runoff_timing(df, name, focus_year)
     f2 = plot_full_year(df, name, focus_year)
-    f3 = plot_daily_trend(df, name)
+    f3 = plot_daily_trend(df, name, iv)
     return f1.to_json(), f2.to_json(), f3.to_json(), build_summary(df, name, focus_year, metrics)
 
 
