@@ -873,7 +873,10 @@ def build_summary(df, name, focus_year, metrics):
 # APP LAYOUT
 # ═════════════════════════════════════════════════════════════════════════════
 
+import os
+
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
+server = app.server  # Expose for gunicorn: gunicorn streamflow_dev:server
 
 app.layout = html.Div(style={
     "backgroundColor": BG, "height": "100vh", "margin": 0, "padding": 0,
@@ -1149,12 +1152,8 @@ def do_search(n, query, existing_opts):
 
 # ═════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 8050))
-    debug = os.environ.get("RENDER") is None  # debug only locally
+    debug = os.environ.get("RENDER") is None
     print(f"\n  Western MT Runoff Explorer")
     print(f"  http://127.0.0.1:{port}\n")
     app.run(host="0.0.0.0", port=port, debug=debug)
-
-# Expose `server` for gunicorn: gunicorn streamflow_dev:server
-server = app.server
